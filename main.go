@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"time"
+
+	"database/sql"
 
 	"github.com/jinzhu/gorm"
 	_ "github.com/jinzhu/gorm/dialects/mysql"
@@ -47,22 +49,30 @@ func GetSchema(db *gorm.DB, dbName string) (Schema, error) {
 	var schema Schema
 	schema.DatabaseName = dbName
 
-	// Get the list of tables
+	// Get the list of tables using GORM
 	rows, err := db.Raw("SHOW TABLES").Rows()
 	if err != nil {
 		return schema, err
 	}
 	defer rows.Close()
 
+	// count := 0
+
 	for rows.Next() {
+		// count++;
+		// if count==4 {
+		// 	break
+		// }
 		var tableName string
 		err = rows.Scan(&tableName)
 		if err != nil {
 			return schema, err
 		}
 
+		// Escape the table name to handle reserved keywords
 		tableName = fmt.Sprintf("`%s`", tableName)
 
+		// Get columns for each table
 		table := Table{Name: tableName}
 		columnRows, err := db.Raw(fmt.Sprintf("DESCRIBE %s", tableName)).Rows()
 		if err != nil {
@@ -93,6 +103,60 @@ func GetSchema(db *gorm.DB, dbName string) (Schema, error) {
 	}
 
 	return schema, nil
+}
+
+// Function to send schema data in chunks
+func sendSchemaInChunks(writer *kafka.Writer, schemaData []byte) error {
+	chunkSize := 5 * 1024 * 1024 // Adjust based on Kafka message limits and payload requirements
+	totalParts := int(math.Ceil(float64(len(schemaData)) / float64(chunkSize)))
+	log.Println("******** Total Parts:", totalParts)
+	for i := 0; i < totalParts; i++ {
+		start := i * chunkSize
+		end := start + chunkSize
+		if end > len(schemaData) {
+			end = len(schemaData)
+		}
+
+		part := schemaData[start:end]
+
+		// Create message with metadata to identify parts
+		msg := kafka.Message{
+			Key:   []byte("schema_key"), // Unique key for schema
+			Value: part,
+			Headers: []kafka.Header{
+				{Key: "schema_id", Value: []byte("unique_schema_id")},
+				{Key: "part_number", Value: []byte(fmt.Sprintf("%d", i))},
+				{Key: "total_parts", Value: []byte(fmt.Sprintf("%d", totalParts))},
+			},
+		}
+
+		// Send message
+		err := writer.WriteMessages(context.Background(), msg)
+		if err != nil {
+			log.Println("Failed to send message part:", err)
+			return err
+		}
+	}
+
+	fmt.Println("Schema data sent in parts successfully.")
+	return nil
+}
+
+func createTrackingTableIfNotExists() {
+	result := db.Exec(`
+        CREATE TABLE IF NOT EXISTS tracking_table (
+            table_name VARCHAR(255) PRIMARY KEY,
+            last_sent_id BIGINT NOT NULL
+        );
+    `)
+	if result.Error != nil {
+		log.Println("Error executing query:", result.Error)
+		return
+	}
+
+	// Optionally, check how many rows were affected
+	rowsAffected := result.RowsAffected
+	log.Printf("Rows affected: %d", rowsAffected)
 }
 
 // fetchData fetches data from a given table since the last sent ID
@@ -135,24 +199,6 @@ func fetchData(tableName string, lastSentID int64) ([]map[string]interface{}, in
 	return data, maxID, nil
 }
 
-// publishDataToKafka publishes data to Kafka topic
-func publishDataToKafka(writer *kafka.Writer, data []map[string]interface{}) error {
-	for _, entry := range data {
-		value, err := json.Marshal(entry)
-		if err != nil {
-			return err
-		}
-
-		err = writer.WriteMessages(context.Background(), kafka.Message{
-			Value: value,
-		})
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // syncTable periodically syncs data from the Prism DB to Kafka
 func syncTable(tableName string, tracking *TrackingTable, writer *kafka.Writer) {
 	for {
@@ -164,7 +210,12 @@ func syncTable(tableName string, tracking *TrackingTable, writer *kafka.Writer) 
 		}
 
 		if len(data) > 0 {
-			err = publishDataToKafka(writer, data)
+			// Serialize schema to JSON
+			schemaJSON, err := json.Marshal(data)
+			if err != nil {
+				log.Fatal("Error serializing schema:", err)
+			}
+			err = sendSchemaInChunks(writer, schemaJSON)
 			if err != nil {
 				log.Println("Error sending data to Kafka:", err)
 				time.Sleep(10 * time.Second)
@@ -189,35 +240,18 @@ func syncTable(tableName string, tracking *TrackingTable, writer *kafka.Writer) 
 	}
 }
 
-func createTrackingTableIfNotExists() {
-	result := db.Exec(`
-        CREATE TABLE IF NOT EXISTS tracking_table (
-            table_name VARCHAR(255) PRIMARY KEY,
-            last_sent_id BIGINT NOT NULL
-        );
-    `)
-	if result.Error != nil {
-		log.Println("Error executing query:", result.Error)
-		return
-	}
-
-	// Optionally, check how many rows were affected
-	rowsAffected := result.RowsAffected
-	log.Printf("Rows affected: %d", rowsAffected)
-}
-
 func main() {
 	// MySQL connection string
-	db, err = gorm.Open("mysql", "root:12345678@tcp(127.0.0.1:3306)/prism_db?charset=utf8&parseTime=True&loc=Local")
+	db, err = gorm.Open("mysql", "root:12345678@tcp(192.168.10.114:3306)/prism_db?charset=utf8&parseTime=True&loc=Local")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
 	// Specify the database name
-	// databaseName := "prism_db"
+	// databaseName := "prism"
 
-	// // Get schema from MySQL using GORM
+	// Get schema from MySQL using GORM
 	// schema, err := GetSchema(db, databaseName)
 	// if err != nil {
 	// 	log.Fatal("Error fetching schema:", err)
@@ -229,27 +263,31 @@ func main() {
 	// 	log.Fatal("Error serializing schema:", err)
 	// }
 
-	writer := kafka.NewWriter(kafka.WriterConfig{
+	// writer := kafka.NewWriter(kafka.WriterConfig{
+	// 	Brokers:          []string{"localhost:9092"},
+	// 	Topic:            "schema",
+	// 	Balancer:         &kafka.LeastBytes{},
+	// 	CompressionCodec: kafka.Lz4.Codec(),
+	// 	BatchSize:        500,              // Reduce if necessary to control message size
+	// 	BatchBytes:       10 * 1024 * 1024, // 1MB (or set appropriately)
+	// 	RequiredAcks:     int(kafka.RequireAll),
+	// })
+
+	dataTopic := kafka.NewWriter(kafka.WriterConfig{
 		Brokers:          []string{"localhost:9092"},
-		Topic:            "variant",
+		Topic:            "data",
 		Balancer:         &kafka.LeastBytes{},
 		CompressionCodec: kafka.Lz4.Codec(),
-		BatchSize:        500,
-		BatchBytes:       2 * 1024 * 1024,
-		MaxAttempts:      5,
-		ReadTimeout:      time.Second * 5,
-		WriteTimeout:     time.Second * 5,
+		BatchSize:        500,              // Reduce if necessary to control message size
+		BatchBytes:       10 * 1024 * 1024, // 1MB (or set appropriately)
 		RequiredAcks:     int(kafka.RequireAll),
 	})
+	// defer writer.Close()
+	defer dataTopic.Close()
 
-	defer writer.Close()
-
-	// // Send schema to Kafka
-	// err = writer.WriteMessages(context.Background(), kafka.Message{
-	// 	Value: schemaJSON,
-	// })
+	// err = sendSchemaInChunks(writer, schemaJSON)
 	// if err != nil {
-	// 	log.Fatal("Error sending message to Kafka:", err)
+	// 	log.Fatal("Error sending schema data to Kafka:", err)
 	// }
 
 	// log.Println("Data published to Kafka successfully.")
@@ -268,8 +306,9 @@ func main() {
 
 	// Start syncing each table concurrently
 	for _, tracking := range trackingTables {
-		go syncTable(tracking.TableName, &tracking, writer)
+		go syncTable(tracking.TableName, &tracking, dataTopic)
 	}
 
+	log.Println("Data published to Kafka successfully.")
 	select {} // Block main goroutine
 }
