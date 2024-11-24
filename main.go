@@ -242,29 +242,40 @@ func syncTable(tableName string, tracking *TrackingTable, writer *kafka.Writer) 
 
 func main() {
 	// MySQL connection string
-	db, err = gorm.Open("mysql", "root:12345678@tcp(192.168.10.114:3306)/prism_db?charset=utf8&parseTime=True&loc=Local")
+	db, err = gorm.Open("mysql", "root:12345678@tcp(192.168.10.250:3306)/kiam_db?charset=utf8&parseTime=True&loc=Local")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
 	// Specify the database name
-	// databaseName := "prism"
+	databaseName := "kiam_db"
 
 	// Get schema from MySQL using GORM
-	// schema, err := GetSchema(db, databaseName)
-	// if err != nil {
-	// 	log.Fatal("Error fetching schema:", err)
-	// }
+	schema, err := GetSchema(db, databaseName)
+	// log.Println(schema)
+	if err != nil {
+		log.Fatal("Error fetching schema:", err)
+	}
 
-	// // Serialize schema to JSON
-	// schemaJSON, err := json.Marshal(schema)
-	// if err != nil {
-	// 	log.Fatal("Error serializing schema:", err)
-	// }
+	// Serialize schema to JSON
+	schemaJSON, err := json.Marshal(schema)
+	if err != nil {
+		log.Fatal("Error serializing schema:", err)
+	}
 
-	// writer := kafka.NewWriter(kafka.WriterConfig{
-	// 	Brokers:          []string{"localhost:9092"},
+	writer := kafka.NewWriter(kafka.WriterConfig{
+		Brokers:          []string{"192.168.10.250:9092"},
+		Topic:            "schema",
+		Balancer:         &kafka.LeastBytes{},
+		CompressionCodec: kafka.Lz4.Codec(),
+		BatchSize:        500,              // Reduce if necessary to control message size
+		BatchBytes:       10 * 1024 * 1024, // 1MB (or set appropriately)
+		RequiredAcks:     int(kafka.RequireAll),
+	})
+
+	// dataTopic := kafka.NewWriter(kafka.WriterConfig{
+	// 	Brokers:          []string{"192.168.10.114:9092"},
 	// 	Topic:            "schema",
 	// 	Balancer:         &kafka.LeastBytes{},
 	// 	CompressionCodec: kafka.Lz4.Codec(),
@@ -272,42 +283,32 @@ func main() {
 	// 	BatchBytes:       10 * 1024 * 1024, // 1MB (or set appropriately)
 	// 	RequiredAcks:     int(kafka.RequireAll),
 	// })
+	defer writer.Close()
+	// defer dataTopic.Close()
 
-	dataTopic := kafka.NewWriter(kafka.WriterConfig{
-		Brokers:          []string{"localhost:9092"},
-		Topic:            "data",
-		Balancer:         &kafka.LeastBytes{},
-		CompressionCodec: kafka.Lz4.Codec(),
-		BatchSize:        500,              // Reduce if necessary to control message size
-		BatchBytes:       10 * 1024 * 1024, // 1MB (or set appropriately)
-		RequiredAcks:     int(kafka.RequireAll),
-	})
-	// defer writer.Close()
-	defer dataTopic.Close()
-
-	// err = sendSchemaInChunks(writer, schemaJSON)
-	// if err != nil {
-	// 	log.Fatal("Error sending schema data to Kafka:", err)
-	// }
+	err = sendSchemaInChunks(writer, schemaJSON)
+	if err != nil {
+		log.Fatal("Error sending schema data to Kafka:", err)
+	}
 
 	// log.Println("Data published to Kafka successfully.")
 
-	createTrackingTableIfNotExists()
+	// createTrackingTableIfNotExists()
 
 	// Define the tables you want to track
-	trackingTables := []TrackingTable{
-		{TableName: "accounts", LastSentID: 0},
-		{TableName: "account_balances", LastSentID: 0},
-		{TableName: "attendance", LastSentID: 0},
-		{TableName: "account_orders", LastSentID: 0},
-		{TableName: "asset_masters", LastSentID: 0},
-		// Add more tables as needed
-	}
+	// trackingTables := []TrackingTable{
+	// 	{TableName: "accounts", LastSentID: 0},
+	// 	{TableName: "account_balances", LastSentID: 0},
+	// 	{TableName: "attendance", LastSentID: 0},
+	// 	{TableName: "account_orders", LastSentID: 0},
+	// 	{TableName: "asset_masters", LastSentID: 0},
+	// 	// Add more tables as needed
+	// }
 
 	// Start syncing each table concurrently
-	for _, tracking := range trackingTables {
-		go syncTable(tracking.TableName, &tracking, dataTopic)
-	}
+	// for _, tracking := range trackingTables {
+	// 	go syncTable(tracking.TableName, &tracking, dataTopic)
+	// }
 
 	log.Println("Data published to Kafka successfully.")
 	select {} // Block main goroutine
